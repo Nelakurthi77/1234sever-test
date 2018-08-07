@@ -1,0 +1,173 @@
+#!/usr/bin/env groovy
+    import groovy.json.JsonSlurper
+pipeline {
+  agent {
+    label 'docker-oracle'
+  }
+
+   environment {
+        ARTIFACT = 'interface-scripts-bundle.tar.gz'
+        VIRTUAL_ENV = "${env.WORKSPACE}/venv"
+    }
+
+    stages {
+
+        stage('Checkout') {
+        steps {
+
+            script {
+          scmVars = checkout scm
+
+          configFileProvider([configFile(fileId: 'c2da8bf2-01f2-4c01-bb24-604452208fc6', variable: 'config')]) {
+            script{
+                serverConfig = sh (
+                  script: "cat ${env.config}",
+                  returnStdout: true
+                  ).trim()
+                  
+                  InputJSON = new groovy.json.JsonSlurperClassic().parseText(serverConfig)
+                  host = "${InputJSON.dev.user}@${InputJSON.dev.interfaceScripts}"
+            }
+          }
+          }
+
+            script {
+                scmVars = checkout scm
+                 // set current build name
+                currentBuild.displayName = "#${env.BUILD_NUMBER} - ${scmVars.GIT_LOCAL_BRANCH}"
+            }
+
+            
+        }
+        }
+         stage("Setup"){
+            steps{
+                sh "python3.6 -m pip install -r requirements.txt --user"
+                sh "python3.6 setup.py develop --user"
+            }
+        }
+
+         stage('HPE Fortify') {
+      steps {
+
+        script {
+          // set current build name
+          fortifyUrl = "${InputJSON.dev.fortifyUrl}"
+          fortifyAuthToken = "${InputJSON.dev.fortifyAuthToken}"
+            
+          // notify bitbucket server about build
+          this.notifyStash('INPROGRESS')
+        }
+
+        echo 'Security Scanning using HP Fortify (Code Review)...'
+        sh "fortifyupdate"
+        sh "sourceanalyzer -b ${JOB_NAME} -clean"
+        sh "sourceanalyzer -b ${JOB_NAME} ${WORKSPACE}"
+        sh "sourceanalyzer -b ${JOB_NAME} -scan -f '${WORKSPACE}/Assessment.fpr'"
+        //sh "BIRTReportGenerator -template 'Developer Workbook' -source '${WORKSPACE}/Assessment.fpr' -format 'PDF' -output '${WORKSPACE}/Security_Findings.pdf'"
+        sh "ls -lrt '${WORKSPACE}' "
+        sh "fortifyclient -url ${fortifyUrl} -authtoken ${fortifyAuthToken} uploadFPR -file ${WORKSPACE}/Assessment.fpr -application ${JOB_NAME} -applicationVersion '1'"
+        //archiveArtifacts artifacts: '**/Security_Findings.pdf'
+      }
+    }
+    stage("Dependency Check") {
+      steps {
+       dependencyCheckAnalyzer datadir: 'dependency-check-data', hintsFile: '', includeCsvReports: true, includeHtmlReports: true, includeVulnReports: true, 
+       includeJsonReports: false, isAutoupdateDisabled: false, outdir: '', scanpath: '', skipOnScmChange: false, skipOnUpstreamChange: false, suppressionFile: 
+       '', zipExtensions: ''
+
+           dependencyCheckPublisher canComputeNew: false, defaultEncoding: '', healthy: '', pattern: '', unHealthy: ''
+
+           archiveArtifacts allowEmptyArchive: true, artifacts: '**/dependency-check-report.xml', onlyIfSuccessful: true 
+      }
+    }
+        
+        stage('Build') {
+            steps {
+                // build archive with server
+                sh "mkdir output && tar --exclude './output' --exclude './.git' -czf output/${ARTIFACT} ./"
+                sh "du -hs output/*"
+
+                // make archive available in Jenkins
+                archiveArtifacts artifacts: "output/${ARTIFACT}", fingerprint: true
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo 'Testing interface-scripts ...'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sshagent (credentials: ['digital-transformation-ssh']) {
+                    configFileProvider([configFile(fileId: 'c2da8bf2-01f2-4c01-bb24-604452208fc6', variable: 'config')]) {
+                        script{
+                            serverConfig = sh (
+                                            script: "cat ${env.config}",
+                                            returnStdout: true
+                                            ).trim()
+                            InputJSON = new groovy.json.JsonSlurperClassic().parseText(serverConfig)
+                            host = "${InputJSON.dev.user}@${InputJSON.dev.interfaceScripts}"
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'sudo rm -rf interface_scripts_temp && mkdir -p interface_scripts_temp && mkdir -p /home/interface_scripts/interface_scripts'"
+                            sh "scp -o StrictHostKeyChecking=no -r output/* ${host}:~/interface_scripts_temp/"
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'cd interface_scripts_temp/; tar -xvf ${ARTIFACT}' "
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'sudo rm -rf /home/interface_scripts/interface_scripts/* ' "
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'sudo mv interface_scripts_temp/* /home/interface_scripts/interface_scripts'"
+                            
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'cd /home/interface_scripts && source env/bin/activate && cd interface_scripts && python3 -m pip install -r requirements.txt && sudo python3 setup.py develop && cd ~interface_scripts/run ' " 
+
+                            sh "ssh -o StrictHostKeyChecking=no ${host} '[ -f syncserver.pid ] && sudo kill `cat syncserver.pid`; exit 0'"
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'sudo /opt/cronicle/bin/control.sh stop'"
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'sudo -i /opt/cronicle/bin/control.sh import /home/interface_scripts/interface_scripts/cronicle/cronicle-data-backup.txt'"
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'sudo /opt/cronicle/bin/control.sh start'"
+
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+  post {
+    failure {
+      // send email to the person who broke the build
+      emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+        replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+        to: emailextrecipients([[$class: 'CulpritsRecipientProvider']]))
+
+    }
+    unstable {
+      // send email to the person who broke the build
+      emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+        replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+        to: emailextrecipients([[$class: 'CulpritsRecipientProvider']]))
+
+    }
+    always {
+      script {
+        // notify bitbucket server about build
+        // null result is success
+        this.notifyStash(currentBuild.result ?: 'SUCCESS')
+      }
+    }
+  }
+}
+
+def notifyStash(String state) {
+
+  if ('SUCCESS' == state || 'FAILED' == state) {
+    currentBuild.result = state
+  }
+
+  step([$class                       : 'StashNotifier',
+        credentialsId                : 'ecommerce-service-account',
+        disableInprogressNotification: false,
+        considerUnstableAsSuccess    : true,
+        ignoreUnverifiedSSLPeer      : true,
+        includeBuildNumberInKey      : false,
+        prependParentProjectKey      : false,
+        stashServerBaseUrl           : 'https://bitbucket.mot-solutions.com'])
+
+}
